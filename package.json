@@ -23,7 +23,7 @@
     "@plasmohq/messaging": "^0.6.1",
     "@plasmohq/storage": "^1.9.0",
     "content-disposition": "^0.5.4",
-    "plasmo": "0.89.4",
+    "plasmo": "0.90.5",
     "react": "18.2.0",
     "react-dom": "18.2.0",
     "react-file-icon": "^1.4.0",
@@ -53,6 +53,7 @@
     ]
   },
   "manifest": {
+    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkPRv86cuPsESn1NOsvicEp/C2LCf0V3m3KDxHHjfiuJJrwXVWknais+Da00yJ1OF2VRuPtsazl2GccRYizpqEO2LqQHWVzRqDauXXbtnk5t3erwgDS5zCiY7VQjG7s4EqlyneQvh20n7b4yngvXLxPQ8YZwaPyViw+2YhqbQW0b7fu2buH7eQNEOHSgEFacgUkzfxyS801Z4q6fTTmDgdS1+XkX4FerdRLOZyaAz0nlWZpmf5HVTSDLVjKevuoHrj7xv7V880gWnN+8dm2n9QegYh0QmTp2srqLr2nmTVh2fY0DF6P3wl50N2pCEUQpNjSePQbYG8bQw9Z10IpP35QIDAQAB",
     "host_permissions": [
       "http://*/*",
       "https://*/*"

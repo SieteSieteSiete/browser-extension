@@ -1,6 +1,5 @@
 import Client from "@gopeed/rest"
 import { type Request } from "@gopeed/types"
-import contentDisposition from "content-disposition"
 import path from "path"
 
 import { Storage } from "@plasmohq/storage"
@@ -172,17 +171,6 @@ chrome.runtime.onStartup &&
 
   // Initialize context menus
   initContextMenus()
-
-  // Cleanup old entries from downloadEventSkipMap every 30 seconds
-  // to prevent memory leaks in case onCreated never fires
-  setInterval(() => {
-    // Note: Since we're using URL as key and deleting immediately after use,
-    // this is just a safety net. In practice, entries should be deleted quickly.
-    if (downloadEventSkipMap.size > 100) {
-      // If map grows too large, clear it entirely as a safety measure
-      downloadEventSkipMap.clear()
-    }
-  }, 30000)
 })()
 
 interface DownloadInfo {
@@ -254,120 +242,122 @@ function downloadHandler(
   return handler
 }
 
-// chrome.downloads.onDeterminingFilename only available in Chrome
-const downloadEvent =
-  chrome.downloads.onDeterminingFilename || chrome.downloads.onCreated
-// In Firefox, the download interception logic will be triggered twice, the order is onHeadersReceived -> onCreated, so a variable is needed to skip the onCreated event to avoid duplicate processing of download tasks.
-// PS: Why not use the onCreated event uniformly? Because the onCreated event cannot get the size of the downloaded file in Firefox.
-// Use a Map to track skip status per-download to avoid race conditions with multiple tabs
-const downloadEventSkipMap = new Map<string, boolean>()
+// CHROME/EDGE: Use onDeterminingFilename for cleaner UX (no download flash)
+if (!isFirefox) {
+  chrome.downloads.onDeterminingFilename.addListener(async (downloadItem, suggest) => {
+    console.log("[Gopeed] onDeterminingFilename fired:", {
+      url: downloadItem.finalUrl || downloadItem.url,
+      filename: downloadItem.filename,
+      fileSize: downloadItem.fileSize,
+      id: downloadItem.id
+    })
 
-downloadEvent.addListener(async function (item) {
-  const info: DownloadInfo = {
-    url: item.finalUrl || item.url,
-    filename: item.filename,
-    filesize: item.fileSize,
-    ua: navigator.userAgent,
-    referrer: item.referrer,
-    cookieStoreId: (item as any).cookieStoreId
-  }
-  const downloadUrl = item.finalUrl || item.url
-  if (isFirefox && downloadEventSkipMap.get(downloadUrl)) {
-    downloadEventSkipMap.delete(downloadUrl)
-    return
-  }
+    const info: DownloadInfo = {
+      url: downloadItem.finalUrl || downloadItem.url,
+      filename: downloadItem.filename,
+      filesize: downloadItem.fileSize || 0,
+      ua: navigator.userAgent,
+      referrer: downloadItem.referrer,
+      cookieStoreId: (downloadItem as any).cookieStoreId
+    }
 
-  if (!downloadFilter(info, settingsCache)) {
-    return
-  }
+    // Apply user's download filters first
+    if (!downloadFilter(info, settingsCache)) {
+      console.log("[Gopeed] Download filtered out:", info.filename)
+      // Let Chrome handle the download normally
+      if (suggest) suggest()
+      return false
+    }
 
-  await chrome.downloads.pause(item.id)
+    // Get handler for this download
+    const handler = downloadHandler(info, settingsCache, isRunningCache)
+    if (!handler) {
+      console.log("[Gopeed] No handler found for download")
+      if (suggest) suggest()
+      return false
+    }
 
-  const handler = downloadHandler(info, settingsCache, isRunningCache)
-  if (!handler) {
-    await chrome.downloads.resume(item.id)
-    return
-  }
+    console.log("[Gopeed] Capturing download:", info.filename)
 
-  await chrome.downloads.cancel(item.id)
-  if (chrome.runtime.lastError) {
-    console.error(chrome.runtime.lastError.message)
-  }
-  if (isFirefox) {
-    await chrome.downloads.erase({ id: item.id })
-  }
+    // Note: We don't cancel the download here because onDeterminingFilename
+    // fires before the download is "in progress", causing "Download must be in progress" error.
+    // Instead, we pause it to prevent progress, then erase from history.
+    try {
+      await chrome.downloads.pause(downloadItem.id)
+    } catch (e) {
+      // Ignore pause errors
+    }
 
-  handler()
-})
+    // Remove from Chrome's download history
+    try {
+      await chrome.downloads.erase({ id: downloadItem.id })
+    } catch (e) {
+      // Ignore erase errors
+    }
 
-function checkContentDisposition(
-  res: chrome.webRequest.WebResponseHeadersDetails
-): string {
-  return res.responseHeaders.find(
-    (header) =>
-      header.name.toLowerCase() === "content-disposition" &&
-      header.value.toLowerCase().startsWith("attachment")
-  )?.value
+    // Execute the download handler (forwards to Gopeed)
+    handler()
+
+    // Return true to indicate we're handling the filename asynchronously
+    // (even though we're canceling, this is required)
+    return true
+  })
 }
 
+// FIREFOX: Use onCreated (simpler, works well in MV2 with persistent background)
 if (isFirefox) {
-  chrome.webRequest.onHeadersReceived.addListener(
-    function (res) {
-      if (res.statusCode !== 200 || res.type == "xmlhttprequest") {
-        return
-      }
+  chrome.downloads.onCreated.addListener(async (downloadItem) => {
+    console.log("[Gopeed] onCreated fired:", {
+      url: downloadItem.url,
+      filename: downloadItem.filename,
+      fileSize: downloadItem.fileSize,
+      id: downloadItem.id
+    })
 
-      const contentDispositionValue = checkContentDisposition(res)
-      if (!contentDispositionValue) {
-        return
-      }
+    const info: DownloadInfo = {
+      url: downloadItem.url,
+      filename: downloadItem.filename || path.basename(downloadItem.url),
+      filesize: downloadItem.fileSize || 0,
+      ua: navigator.userAgent,
+      referrer: downloadItem.referrer,
+      cookieStoreId: (downloadItem as any).cookieStoreId,
+      tabId: downloadItem.id
+    }
 
-      // Skip the onCreated event to avoid duplicate processing of download tasks.
-      downloadEventSkipMap.set(res.url, true)
+    // Apply user's download filters first
+    if (!downloadFilter(info, settingsCache)) {
+      console.log("[Gopeed] Download filtered out:", info.filename)
+      return
+    }
 
-      let filename = ""
-      // Parse filename from content-disposition
-      if (contentDispositionValue) {
-        const parse = contentDisposition.parse(contentDispositionValue)
-        filename = parse.parameters.filename
-      } else {
-        filename = path.basename(res.url)
-      }
+    // Get handler for this download
+    const handler = downloadHandler(info, settingsCache, isRunningCache)
+    if (!handler) {
+      console.log("[Gopeed] No handler found for download")
+      return
+    }
 
-      let filesize = 0
-      const contentLength = res.responseHeaders.find(
-        (header) => header.name.toLowerCase() === "content-length"
-      )?.value
-      if (contentLength) {
-        filesize = parseInt(contentLength)
-      }
+    console.log("[Gopeed] Capturing download:", info.filename)
 
-      const info: DownloadInfo = {
-        url: res.url,
-        filename,
-        filesize,
-        ua: navigator.userAgent,
-        referrer: (res as any).originUrl,
-        cookieStoreId: (res as any).cookieStoreId,
-        tabId: res.tabId
-      }
-      if (!downloadFilter(info, settingsCache)) {
-        return
-      }
+    // Cancel Firefox's built-in download immediately
+    try {
+      await chrome.downloads.cancel(downloadItem.id)
+    } catch (e) {
+      console.warn("Failed to cancel download:", e)
+    }
 
-      const handler = downloadHandler(info, settingsCache)
-      if (!handler) {
-        return
-      }
+    // Optionally erase from Firefox's download history
+    try {
+      await chrome.downloads.erase({ id: downloadItem.id })
+    } catch (e) {
+      // Ignore erase errors
+    }
 
-      handler()
-
-      return { cancel: true }
-    },
-    { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] },
-    ["blocking", "responseHeaders"]
-  )
+    // Execute the download handler (forwards to Gopeed)
+    handler()
+  })
 }
+
 
 function handleRemoteDownload(
   info: DownloadInfo,
@@ -582,9 +572,11 @@ function handleNativeDownload(
   isRunning: boolean
 ): Function | undefined {
   if (!connectNativePort) {
+    console.warn("[Gopeed] Native port not available - is Gopeed running?")
     return
   }
   if (!settings.autoWakeup && !isRunning) {
+    console.warn("[Gopeed] Gopeed not running and auto-wakeup disabled")
     return
   }
 
@@ -611,7 +603,7 @@ function handleNativeDownload(
         )
       }
     } catch (e) {
-      console.error(e)
+      console.error("[Gopeed] Native download failed:", e)
       if (!settings.confirmBeforeDownload) {
         await showNativeNotification(
           "error",
